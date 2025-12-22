@@ -6,14 +6,14 @@ import pathlib
 from typing import List
 
 import imageio
+import numpy as np
+import tqdm
+import tyro
 from libero.libero import benchmark
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
-import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
-import tqdm
-import tyro
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -35,17 +35,17 @@ class Args:
     task_suite_name: str = (
         "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
-    num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
+    num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50  # Number of rollouts per task
 
     #################################################################################################################
-    # External sine force (applied every sim step)
+    # External sine force (applied every sim step after wait)
     #################################################################################################################
     apply_force: bool = True
     force_object_name: str = ""  # If empty, use first non-fixture obj_of_interest
     force_amp_xy: List[float] = dataclasses.field(
         default_factory=lambda: [0.5, 0.5]
-    )  # Newtons on x, y (roughly ~10× bowl weight of 0.005 kg => ~0.05 N)
+    )  # Newtons on x, y
     force_amp_z: float = 0.0  # Newtons on z (optional)
     torque_amp_xyz: List[float] = dataclasses.field(
         default_factory=lambda: [0.0, 0.0, 0.0]
@@ -125,6 +125,13 @@ def eval_libero(args: Args) -> None:
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
                 try:
+                    # Wait phase: no external force, just let objects fall
+                    if t < args.num_steps_wait:
+                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                        t += 1
+                        continue
+
+                    # After wait: apply sine force before stepping
                     if args.apply_force and force_obj_name is not None:
                         _apply_sine_force(
                             env=env,
@@ -135,13 +142,6 @@ def eval_libero(args: Args) -> None:
                             torque_amp_xyz=args.torque_amp_xyz,
                             freq_hz=args.force_freq_hz,
                         )
-
-                    # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
-                    # and we need to wait for them to fall
-                    if t < args.num_steps_wait:
-                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
-                        t += 1
-                        continue
 
                     # Get preprocessed image
                     # IMPORTANT: rotate 180 degrees to match train preprocessing
