@@ -6,6 +6,7 @@ import pathlib
 from typing import List, Optional
 
 import imageio
+import mujoco
 from libero.libero import benchmark
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
@@ -124,6 +125,19 @@ def eval_libero(args: Args) -> None:
             replay_images = []
             dt = _get_control_dt(env)
             motion_enabled = True  # disable once grasped
+            grasp_contact_steps = 0
+            grasp_contact_needed = 3
+            grasp_force_threshold = 0.5  # Newtons in contact normal
+            target_body_id = (
+                env.env.obj_body_id[motion_obj_name]
+                if motion_obj_name is not None
+                else None
+            )
+            gripper_geom_ids = (
+                _get_gripper_geom_ids(env.env.sim)
+                if motion_obj_name is not None
+                else []
+            )
 
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
@@ -135,9 +149,22 @@ def eval_libero(args: Args) -> None:
                         t += 1
                         continue
 
-                    # Stop motion if grasped (heuristic on gripper closure)
-                    if motion_enabled and _is_grasped(obs):
-                        motion_enabled = False
+                    # Stop motion if grasped: require target contact with gripper and normal force above threshold for a few steps
+                    if motion_enabled and target_body_id is not None:
+                        contact_forces = _get_grasp_normal_forces(
+                            env.env.sim, target_body_id, gripper_geom_ids
+                        )
+                        if contact_forces:
+                            print(
+                                f"[contact] normal forces: "
+                                f"{', '.join(f'{f:.3f}' for f in contact_forces)}"
+                            )
+                        if any(f > grasp_force_threshold for f in contact_forces):
+                            grasp_contact_steps += 1
+                        else:
+                            grasp_contact_steps = 0
+                        if grasp_contact_steps >= grasp_contact_needed:
+                            motion_enabled = False
 
                     # After wait: apply sine motion before stepping
                     if (
@@ -203,8 +230,21 @@ def eval_libero(args: Args) -> None:
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
-                    if motion_enabled and _is_grasped(obs):
-                        motion_enabled = False
+                    if motion_enabled and target_body_id is not None:
+                        contact_forces = _get_grasp_normal_forces(
+                            env.env.sim, target_body_id, gripper_geom_ids
+                        )
+                        if contact_forces:
+                            print(
+                                f"[contact] normal forces: "
+                                f"{', '.join(f'{f:.3f}' for f in contact_forces)}"
+                            )
+                        if any(f > grasp_force_threshold for f in contact_forces):
+                            grasp_contact_steps += 1
+                        else:
+                            grasp_contact_steps = 0
+                        if grasp_contact_steps >= grasp_contact_needed:
+                            motion_enabled = False
                     if done:
                         task_successes += 1
                         total_successes += 1
@@ -339,15 +379,37 @@ def _validate_motion_args(args: Args) -> None:
         raise ValueError("motion_mode must be either 'position' or 'velocity'.")
 
 
-def _is_grasped(obs, close_threshold=0.015):
-    """Heuristic: gripper sufficiently closed -> treat as grasped.
+def _get_gripper_geom_ids(sim):
+    """Collect gripper geom ids heuristically by name."""
+    geom_ids = []
+    for geom_id in range(sim.model.ngeom):
+        name = mujoco.mj_id2name(sim.model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+        if name is None:
+            continue
+        if any(key in name.lower() for key in ["finger", "gripper", "pad"]):
+            geom_ids.append(geom_id)
+    return geom_ids
 
-    Use mean absolute qpos so opposing finger signs (e.g., 0.03, -0.03) don't cancel out.
-    """
-    qpos = obs.get("robot0_gripper_qpos", None)
-    if qpos is None:
-        return False
-    return float(np.mean(np.abs(qpos))) < close_threshold
+
+def _get_grasp_normal_forces(sim, target_body_id, gripper_geom_ids):
+    """Return list of normal forces for contacts between gripper geoms and target body."""
+    forces = []
+    force_vec = np.zeros(6, dtype=np.float64)
+    ncon = sim.data.ncon
+    for i in range(ncon):
+        c = sim.data.contact[i]
+        # Skip contacts not involving the target body
+        body1 = sim.model.geom_bodyid[c.geom1]
+        body2 = sim.model.geom_bodyid[c.geom2]
+        if target_body_id not in (body1, body2):
+            continue
+        # Require the other geom to be part of the gripper
+        if c.geom1 in gripper_geom_ids or c.geom2 in gripper_geom_ids:
+            mujoco.mj_contactForce(sim.model, sim.data, i, force_vec)
+            # Contact frame: z is normal
+            normal_f = force_vec[2]
+            forces.append(normal_f)
+    return forces
 
 
 def _quat2axisangle(quat):
