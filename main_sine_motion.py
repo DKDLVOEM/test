@@ -339,12 +339,15 @@ def _validate_motion_args(args: Args) -> None:
         raise ValueError("motion_mode must be either 'position' or 'velocity'.")
 
 
-def _is_grasped(obs, close_threshold=0.01):
-    """Heuristic: gripper sufficiently closed -> treat as grasped."""
+def _is_grasped(obs, close_threshold=0.015):
+    """Heuristic: gripper sufficiently closed -> treat as grasped.
+
+    Use mean absolute qpos so opposing finger signs (e.g., 0.03, -0.03) don't cancel out.
+    """
     qpos = obs.get("robot0_gripper_qpos", None)
     if qpos is None:
         return False
-    return float(np.mean(qpos)) < close_threshold
+    return float(np.mean(np.abs(qpos))) < close_threshold
 
 
 def _quat2axisangle(quat):
