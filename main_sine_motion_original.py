@@ -123,28 +123,11 @@ def eval_libero(args: Args) -> None:
             t = 0
             replay_images = []
             dt = _get_control_dt(env)
-            motion_enabled = True  # disable once grasped
 
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
                 try:
-                    # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
-                    # and we need to wait for them to fall
-                    if t < args.num_steps_wait:
-                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
-                        t += 1
-                        continue
-
-                    # Stop motion if grasped (heuristic on gripper closure)
-                    if motion_enabled and _is_grasped(obs):
-                        motion_enabled = False
-
-                    # After wait: apply sine motion before stepping
-                    if (
-                        motion_enabled
-                        and args.apply_motion
-                        and motion_obj_name is not None
-                    ):
+                    if args.apply_motion and motion_obj_name is not None:
                         _apply_xy_sine_motion(
                             env=env,
                             obj_name=motion_obj_name,
@@ -154,6 +137,13 @@ def eval_libero(args: Args) -> None:
                             freq_hz=args.motion_freq_hz,
                             mode=args.motion_mode,
                         )
+
+                    # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
+                    # and we need to wait for them to fall
+                    if t < args.num_steps_wait:
+                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                        t += 1
+                        continue
 
                     # Get preprocessed image
                     # IMPORTANT: rotate 180 degrees to match train preprocessing
@@ -203,8 +193,6 @@ def eval_libero(args: Args) -> None:
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
-                    if motion_enabled and _is_grasped(obs):
-                        motion_enabled = False
                     if done:
                         task_successes += 1
                         total_successes += 1
@@ -337,14 +325,6 @@ def _validate_motion_args(args: Args) -> None:
         raise ValueError("motion_amp_xy must have 2 floats (x, y amplitude).")
     if args.motion_mode not in ["position", "velocity"]:
         raise ValueError("motion_mode must be either 'position' or 'velocity'.")
-
-
-def _is_grasped(obs, close_threshold=0.01):
-    """Heuristic: gripper sufficiently closed -> treat as grasped."""
-    qpos = obs.get("robot0_gripper_qpos", None)
-    if qpos is None:
-        return False
-    return float(np.mean(qpos)) < close_threshold
 
 
 def _quat2axisangle(quat):
