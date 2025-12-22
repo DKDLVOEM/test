@@ -3,7 +3,7 @@ import dataclasses
 import logging
 import math
 import pathlib
-from typing import List
+from typing import List, Optional
 
 import imageio
 from libero.libero import benchmark
@@ -39,18 +39,15 @@ class Args:
     num_trials_per_task: int = 50  # Number of rollouts per task
 
     #################################################################################################################
-    # External sine force (applied every sim step)
+    # Object motion (applied every sim step)
     #################################################################################################################
-    apply_force: bool = True
-    force_object_name: str = ""  # If empty, use first non-fixture obj_of_interest
-    force_amp_xy: List[float] = dataclasses.field(
-        default_factory=lambda: [0.5, 0.5]
-    )  # Newtons on x, y (roughly ~10× bowl weight of 0.005 kg => ~0.05 N)
-    force_amp_z: float = 0.0  # Newtons on z (optional)
-    torque_amp_xyz: List[float] = dataclasses.field(
-        default_factory=lambda: [0.0, 0.0, 0.0]
-    )  # optional torque amplitudes
-    force_freq_hz: float = 0.5  # Hz
+    apply_motion: bool = True
+    motion_object_name: str = ""  # If empty, use first non-fixture obj_of_interest
+    motion_mode: str = "position"  # "position" or "velocity"
+    motion_amp_xy: List[float] = dataclasses.field(
+        default_factory=lambda: [0.02, 0.02]
+    )  # meters
+    motion_freq_hz: float = 0.5  # Hz
 
     #################################################################################################################
     # Utils
@@ -63,7 +60,7 @@ class Args:
 def eval_libero(args: Args) -> None:
     # Set random seed
     np.random.seed(args.seed)
-    _validate_force_args(args)
+    _validate_motion_args(args)
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -99,10 +96,10 @@ def eval_libero(args: Args) -> None:
 
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
-        force_obj_name = _resolve_force_object_name(env, args.force_object_name)
-        if args.apply_force and force_obj_name is None:
+        motion_obj_name = _resolve_motion_object_name(env, args.motion_object_name)
+        if args.apply_motion and motion_obj_name is None:
             logging.warning(
-                "apply_force=True but no object of interest found; skipping forces for this task."
+                "apply_motion=True but no object of interest found; skipping motion for this task."
             )
 
         # Start episodes
@@ -117,6 +114,11 @@ def eval_libero(args: Args) -> None:
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
 
+            # Base pose for motion target
+            base_qpos = None
+            if args.apply_motion and motion_obj_name is not None:
+                base_qpos = _get_object_qpos(env, motion_obj_name)
+
             # Setup
             t = 0
             replay_images = []
@@ -125,15 +127,15 @@ def eval_libero(args: Args) -> None:
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
                 try:
-                    if args.apply_force and force_obj_name is not None:
-                        _apply_sine_force(
+                    if args.apply_motion and motion_obj_name is not None:
+                        _apply_xy_sine_motion(
                             env=env,
-                            obj_name=force_obj_name,
+                            obj_name=motion_obj_name,
+                            base_qpos=base_qpos,
                             t_sec=t * dt,
-                            amp_xy=args.force_amp_xy,
-                            amp_z=args.force_amp_z,
-                            torque_amp_xyz=args.torque_amp_xyz,
-                            freq_hz=args.force_freq_hz,
+                            amp_xy=args.motion_amp_xy,
+                            freq_hz=args.motion_freq_hz,
+                            mode=args.motion_mode,
                         )
 
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -251,7 +253,7 @@ def _get_libero_env(task, resolution, seed):
     return env, task_description
 
 
-def _resolve_force_object_name(env, requested_name):
+def _resolve_motion_object_name(env, requested_name):
     if requested_name:
         return requested_name
     if not env.obj_of_interest:
@@ -262,19 +264,54 @@ def _resolve_force_object_name(env, requested_name):
     return env.obj_of_interest[0]
 
 
-def _apply_sine_force(env, obj_name, t_sec, amp_xy, amp_z, torque_amp_xyz, freq_hz):
-    omega = 2.0 * math.pi * freq_hz
-    fx = amp_xy[0] * math.sin(omega * t_sec)
-    fy = amp_xy[1] * math.cos(omega * t_sec)
-    fz = amp_z * math.sin(omega * t_sec)
-    tx = torque_amp_xyz[0] * math.sin(omega * t_sec)
-    ty = torque_amp_xyz[1] * math.cos(omega * t_sec)
-    tz = torque_amp_xyz[2] * math.sin(omega * t_sec)
+def _get_object_joint_name(env, obj_name):
+    if obj_name not in env.env.objects_dict:
+        raise ValueError(f"Object '{obj_name}' is not a movable object.")
+    obj = env.env.objects_dict[obj_name]
+    if not obj.joints:
+        raise ValueError(f"Object '{obj_name}' has no joints to control.")
+    return obj.joints[-1]
 
-    body_id = env.env.obj_body_id[obj_name]
-    env.env.sim.data.xfrc_applied[body_id] = np.array(
-        [fx, fy, fz, tx, ty, tz], dtype=np.float32
-    )
+
+def _get_object_qpos(env, obj_name):
+    joint = _get_object_joint_name(env, obj_name)
+    return env.env.sim.data.get_joint_qpos(joint).copy()
+
+
+def _set_object_qpos(env, obj_name, qpos):
+    joint = _get_object_joint_name(env, obj_name)
+    env.env.sim.data.set_joint_qpos(joint, qpos)
+    env.env.sim.forward()
+
+
+def _set_object_qvel(env, obj_name, qvel):
+    joint = _get_object_joint_name(env, obj_name)
+    env.env.sim.data.set_joint_qvel(joint, qvel)
+    env.env.sim.forward()
+
+
+def _apply_xy_sine_motion(env, obj_name, base_qpos, t_sec, amp_xy, freq_hz, mode):
+    omega = 2.0 * math.pi * freq_hz
+    dx = amp_xy[0] * math.sin(omega * t_sec)
+    dy = amp_xy[1] * math.cos(omega * t_sec)
+
+    if mode == "position":
+        qpos = base_qpos.copy()
+        qpos[0] = base_qpos[0] + dx
+        qpos[1] = base_qpos[1] + dy
+        _set_object_qpos(env, obj_name, qpos)
+        return
+
+    if mode == "velocity":
+        vx = amp_xy[0] * omega * math.cos(omega * t_sec)
+        vy = -amp_xy[1] * omega * math.sin(omega * t_sec)
+        qvel = np.zeros(6, dtype=np.float32)
+        qvel[0] = vx
+        qvel[1] = vy
+        _set_object_qvel(env, obj_name, qvel)
+        return
+
+    raise ValueError(f"Unknown motion_mode: {mode}")
 
 
 def _get_control_dt(env):
@@ -283,13 +320,11 @@ def _get_control_dt(env):
     return float(env.env.sim.model.opt.timestep)
 
 
-def _validate_force_args(args: Args) -> None:
-    if len(args.force_amp_xy) != 2:
-        raise ValueError("force_amp_xy must have 2 floats (x, y amplitude).")
-    if len(args.torque_amp_xyz) != 3:
-        raise ValueError("torque_amp_xyz must have 3 floats.")
-    if args.force_freq_hz <= 0:
-        raise ValueError("force_freq_hz must be > 0.")
+def _validate_motion_args(args: Args) -> None:
+    if len(args.motion_amp_xy) != 2:
+        raise ValueError("motion_amp_xy must have 2 floats (x, y amplitude).")
+    if args.motion_mode not in ["position", "velocity"]:
+        raise ValueError("motion_mode must be either 'position' or 'velocity'.")
 
 
 def _quat2axisangle(quat):
