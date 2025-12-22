@@ -383,10 +383,14 @@ def _get_gripper_geom_ids(sim):
     """Collect gripper geom ids heuristically by name."""
     geom_ids = []
     for geom_id in range(sim.model.ngeom):
-        name = mujoco.mj_id2name(sim.model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
-        if name is None:
+        try:
+            # geom_names is an array of bytes; decode to str
+            name = sim.model.geom_names[geom_id]
+            if name:
+                name = name.decode("utf-8")
+        except Exception:
             continue
-        if any(key in name.lower() for key in ["finger", "gripper", "pad"]):
+        if name and any(key in name.lower() for key in ["finger", "gripper", "pad"]):
             geom_ids.append(geom_id)
     return geom_ids
 
