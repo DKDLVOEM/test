@@ -30,6 +30,13 @@ class Args:
     num_steps_wait: int = 10
     num_trials_per_task: int = 50
 
+    # Object motion (applied every sim step)
+    apply_motion: bool = True
+    motion_object_name: str = ""  # If empty, use resolved target object
+    motion_mode: str = "velocity"  # "position" or "velocity"
+    motion_amp_xy: List[float] = dataclasses.field(default_factory=lambda: [1.0, 1.0])
+    motion_freq_hz: float = 0.5
+
     # MPPI on/off
     use_mppi: bool = True
 
@@ -200,6 +207,7 @@ class MPPILiberoController:
 
 def eval_libero(args: Args) -> None:
     np.random.seed(args.seed)
+    _validate_motion_args(args)
 
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
@@ -226,6 +234,12 @@ def eval_libero(args: Args) -> None:
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
         target_obj_name = _resolve_target_object(env)
+        motion_obj_name = args.motion_object_name or target_obj_name
+        base_qpos = (
+            _get_object_qpos(env, motion_obj_name)
+            if args.apply_motion and motion_obj_name is not None
+            else None
+        )
 
         # build MPPI once (need dt)
         if controller is None and args.use_mppi:
@@ -270,6 +284,18 @@ def eval_libero(args: Args) -> None:
                         obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
                         t += 1
                         continue
+
+                    # Apply external motion to target object (sine in xy)
+                    if args.apply_motion and motion_obj_name is not None and base_qpos is not None:
+                        _apply_xy_sine_motion(
+                            env=env,
+                            obj_name=motion_obj_name,
+                            base_qpos=base_qpos,
+                            t_sec=t * dt,
+                            amp_xy=args.motion_amp_xy,
+                            freq_hz=args.motion_freq_hz,
+                            mode=args.motion_mode,
+                        )
 
                     # gather images for replay
                     img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
@@ -388,6 +414,77 @@ def _resolve_target_object(env) -> str:
     if hasattr(env.env, "objects_dict") and env.env.objects_dict:
         return list(env.env.objects_dict.keys())[0]
     raise ValueError("No target object could be resolved from the environment.")
+
+
+def _get_object_joint_name(env, obj_name):
+    if obj_name not in env.env.objects_dict:
+        raise ValueError(f"Object '{obj_name}' is not a movable object.")
+    obj = env.env.objects_dict[obj_name]
+    if not obj.joints:
+        raise ValueError(f"Object '{obj_name}' has no joints to control.")
+    return obj.joints[-1]
+
+
+def _get_object_qpos(env, obj_name):
+    joint = _get_object_joint_name(env, obj_name)
+    return env.env.sim.data.get_joint_qpos(joint).copy()
+
+
+def _set_object_qpos(env, obj_name, qpos):
+    joint = _get_object_joint_name(env, obj_name)
+    sim = env.env.sim
+    sim.data.set_joint_qpos(joint, qpos)
+    # Zero the corresponding joint velocity to avoid residual drift
+    try:
+        qvel_addr = sim.model.get_joint_qvel_addr(joint)
+        if isinstance(qvel_addr, (list, tuple, np.ndarray)):
+            sim.data.qvel[qvel_addr[0] : qvel_addr[-1] + 1] = 0
+        else:
+            sim.data.qvel[qvel_addr] = 0
+    except Exception:
+        sim.data.qvel[:] = 0
+    sim.forward()
+
+
+def _set_object_qvel(env, obj_name, qvel):
+    joint = _get_object_joint_name(env, obj_name)
+    env.env.sim.data.set_joint_qvel(joint, qvel)
+    env.env.sim.forward()
+
+
+def _apply_xy_sine_motion(env, obj_name, base_qpos, t_sec, amp_xy, freq_hz, mode):
+    # No-op if amplitude is effectively zero
+    if abs(amp_xy[0]) < 1e-6 and abs(amp_xy[1]) < 1e-6:
+        return
+
+    omega = 2.0 * math.pi * freq_hz
+    dx = amp_xy[0] * math.sin(omega * t_sec)
+    dy = amp_xy[1] * math.cos(omega * t_sec)
+
+    if mode == "position":
+        qpos = base_qpos.copy()
+        qpos[0] = base_qpos[0] + dx
+        qpos[1] = base_qpos[1] + dy
+        _set_object_qpos(env, obj_name, qpos)
+        return
+
+    if mode == "velocity":
+        vx = amp_xy[0] * omega * math.cos(omega * t_sec)
+        vy = -amp_xy[1] * omega * math.sin(omega * t_sec)
+        qvel = np.zeros(6, dtype=np.float32)
+        qvel[0] = vx
+        qvel[1] = vy
+        _set_object_qvel(env, obj_name, qvel)
+        return
+
+    raise ValueError(f"Unknown motion_mode: {mode}")
+
+
+def _validate_motion_args(args: Args) -> None:
+    if len(args.motion_amp_xy) != 2:
+        raise ValueError("motion_amp_xy must have 2 floats (x, y amplitude).")
+    if args.motion_mode not in ["position", "velocity"]:
+        raise ValueError("motion_mode must be either 'position' or 'velocity'.")
 
 
 if __name__ == "__main__":
