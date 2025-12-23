@@ -332,8 +332,19 @@ def _get_object_qpos(env, obj_name):
 
 def _set_object_qpos(env, obj_name, qpos):
     joint = _get_object_joint_name(env, obj_name)
-    env.env.sim.data.set_joint_qpos(joint, qpos)
-    env.env.sim.forward()
+    sim = env.env.sim
+    sim.data.set_joint_qpos(joint, qpos)
+    # Zero the corresponding joint velocity to avoid residual drift
+    try:
+        qvel_addr = sim.model.get_joint_qvel_addr(joint)
+        if isinstance(qvel_addr, (list, tuple, np.ndarray)):
+            sim.data.qvel[qvel_addr[0] : qvel_addr[-1] + 1] = 0
+        else:
+            sim.data.qvel[qvel_addr] = 0
+    except Exception:
+        # Fallback: zero all velocities (safer than leaving residual motion)
+        sim.data.qvel[:] = 0
+    sim.forward()
 
 
 def _set_object_qvel(env, obj_name, qvel):
@@ -343,6 +354,10 @@ def _set_object_qvel(env, obj_name, qvel):
 
 
 def _apply_xy_sine_motion(env, obj_name, base_qpos, t_sec, amp_xy, freq_hz, mode):
+    # No-op if amplitude is effectively zero
+    if abs(amp_xy[0]) < 1e-6 and abs(amp_xy[1]) < 1e-6:
+        return
+
     omega = 2.0 * math.pi * freq_hz
     dx = amp_xy[0] * math.sin(omega * t_sec)
     dy = amp_xy[1] * math.cos(omega * t_sec)
