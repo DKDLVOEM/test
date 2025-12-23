@@ -35,7 +35,7 @@ class Args:
     motion_object_name: str = ""  # If empty, use resolved target object
     motion_mode: str = "velocity"  # "position" or "velocity"
     motion_amp_xy: List[float] = dataclasses.field(default_factory=lambda: [1.0, 1.0])
-    motion_freq_hz: float = 0.5
+    motion_freq_hz: float = 0.05
 
     # MPPI on/off
     use_mppi: bool = True
