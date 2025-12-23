@@ -225,6 +225,7 @@ def eval_libero(args: Args) -> None:
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+        target_obj_name = _resolve_target_object(env)
 
         # build MPPI once (need dt)
         if controller is None and args.use_mppi:
@@ -257,7 +258,7 @@ def eval_libero(args: Args) -> None:
             t = 0
             replay_images = []
 
-            prev_obj_pos = _get_obj_pos(env, task.obj_name)
+            prev_obj_pos = _get_obj_pos(env, target_obj_name)
             prev_obj_time = 0.0
             dt = 1.0 / env.env.control_freq if hasattr(env.env, "control_freq") else env.env.sim.model.opt.timestep
 
@@ -297,7 +298,7 @@ def eval_libero(args: Args) -> None:
                         A_ref = np.array(action_chunk, dtype=np.float32)
 
                     # estimate object velocity (finite difference)
-                    curr_obj_pos = _get_obj_pos(env, task.obj_name)
+                    curr_obj_pos = _get_obj_pos(env, target_obj_name)
                     curr_time = t * dt
                     obj_vel = (curr_obj_pos - prev_obj_pos) / max(curr_time - prev_obj_time, 1e-6)
                     prev_obj_pos, prev_obj_time = curr_obj_pos, curr_time
@@ -371,6 +372,22 @@ def _quat2axisangle(quat):
 def _get_obj_pos(env, obj_name: str) -> np.ndarray:
     body_id = env.env.obj_body_id[obj_name]
     return np.array(env.env.sim.data.body_xpos[body_id])
+
+
+def _resolve_target_object(env) -> str:
+    """Pick first non-fixture obj_of_interest; fallback to first obj_of_interest."""
+    if hasattr(env, "obj_of_interest") and env.obj_of_interest:
+        for name in env.obj_of_interest:
+            try:
+                if not env.env.is_fixture(name):
+                    return name
+            except Exception:
+                continue
+        return env.obj_of_interest[0]
+    # Last resort: pick first key from objects_dict
+    if hasattr(env.env, "objects_dict") and env.env.objects_dict:
+        return list(env.env.objects_dict.keys())[0]
+    raise ValueError("No target object could be resolved from the environment.")
 
 
 if __name__ == "__main__":
