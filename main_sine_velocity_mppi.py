@@ -40,14 +40,13 @@ class Args:
     # MPPI on/off
     use_mppi: bool = True
 
-    # MPPI params
-    mppi_horizon: int = 15
-    mppi_num_samples: int = 64
-    mppi_temperature: float = 1.0
-    mppi_noise_sigma: float = 0.02  # scaled per phase
+    # MPPI params (kinematics-only)
+    mppi_horizon: int = 10
+    mppi_num_samples: int = 32
+    mppi_lambda: float = 1.0  # temperature
+    mppi_noise_sigma: float = 0.02  # base sigma for xyz / orient; gripper noise scaled down
     w_ref: float = 1.0
     w_goal: float = 5.0
-    w_dyn: float = 5.0
     w_reg: float = 0.1
     w_obs: float = 0.0  # keep 0 for now
 
@@ -59,150 +58,128 @@ class Args:
     seed: int = 7  # Random Seed (for reproducibility)
 
 
-class MPPILiberoController:
-    """
-    Simulator-in-the-loop MPPI around pi0 action reference.
-    """
+class EEFKinematicsMPPIController:
+    """Kinematics-only MPPI around pi0 action reference (no MuJoCo rollouts)."""
 
     def __init__(
         self,
         horizon: int,
         num_samples: int,
+        dt: float,
         temperature: float,
         base_noise_sigma: float,
         weights: dict,
         d_far: float,
         d_close: float,
-        dt: float,
     ):
         self.horizon = horizon
         self.num_samples = num_samples
+        self.dt = dt
         self.temperature = temperature
         self.base_noise_sigma = base_noise_sigma
         self.w_ref = weights["w_ref"]
         self.w_goal = weights["w_goal"]
-        self.w_dyn = weights["w_dyn"]
         self.w_reg = weights["w_reg"]
         self.w_obs = weights["w_obs"]
         self.d_far = d_far
         self.d_close = d_close
-        self.dt = dt
 
     def plan(
         self,
-        env,
-        obs,
+        x0: np.ndarray,
         A_ref: np.ndarray,
-        obj_pos: np.ndarray,
-        obj_vel: np.ndarray,
+        p_obj: np.ndarray,
+        v_obj: np.ndarray,
+        gripper_cmd_ref: float,
     ) -> np.ndarray:
         """
+        Kinematics-only MPPI around pi0 reference actions.
+
         Args:
-            env: LIBERO env (OffScreenRenderEnv)
-            obs: current observation dict
-            A_ref: [H, action_dim] reference from pi0
-            obj_pos: current object position (3,)
-            obj_vel: current object linear velocity (3,)
+            x0: (7,) current state [p(3), aa(3), g(1)]
+            A_ref: [H,7] reference from pi0
+            p_obj: (3,) current object position
+            v_obj: (3,) estimated object velocity
+            gripper_cmd_ref: scalar gripper command of first ref step
         Returns:
-            u_opt: (action_dim,) to pass to env.step
+            u_opt: (7,) to pass to env.step
         """
-        assert A_ref.ndim == 2
-        H_ref, action_dim = A_ref.shape
+        assert A_ref.ndim == 2 and A_ref.shape[1] == 7
+        H_ref = A_ref.shape[0]
         K = min(self.horizon, H_ref)
+        u_ref = A_ref[:K]
 
-        # Phase + weights/noise gating
-        p_ee = obs["robot0_eef_pos"]
-        d = np.linalg.norm(p_ee - obj_pos)
-        phase = self._compute_phase(d, obs)
-        w_ref, w_goal, w_dyn, w_reg, noise_sigma = self._phase_weights_noise(phase)
+        # Phase gating
+        p_ee = x0[:3]
+        d = np.linalg.norm(p_ee - p_obj)
+        phase = self._compute_phase(d, gripper_cmd_ref)
+        w_goal, w_ref, w_reg, noise_scale = self._phase_weights_noise(phase)
 
-        # If in GRASP phase, just return pi0 action directly (no MPPI)
+        # Grasp phase: follow pi0
         if phase == "grasp":
-            return A_ref[0]
+            return u_ref[0]
 
-        # Backup sim state once
-        sim_state = env.get_sim_state()
+        # Noise sigma per dim (gripper noise reduced)
+        sigma_vec = np.ones(7, dtype=np.float32) * self.base_noise_sigma * noise_scale
+        sigma_vec[-1] *= 0.2
 
+        eps = np.random.normal(scale=sigma_vec, size=(self.num_samples, K, 7))
         costs = np.zeros(self.num_samples, dtype=np.float32)
-        actions = np.zeros((self.num_samples, K, action_dim), dtype=np.float32)
 
-        # Sample trajectories
         for j in range(self.num_samples):
-            env.set_state(sim_state)  # restore
-            env.env.sim.forward()
-
-            # Sample noise around reference
-            noise = np.random.normal(scale=noise_sigma, size=(K, action_dim))
-            u_seq = A_ref[:K] + noise
-            actions[j] = u_seq
-
+            x = x0.copy()
             J = 0.0
             for k in range(K):
-                # Rollout one step
-                obs_k, _, _, _ = env.step(u_seq[k].tolist())
-
-                # Predicted object pos (linear)
+                u_k = u_ref[k] + eps[j, k]
+                x = self._dynamics_step(x, u_k)
                 t_pred = (k + 1) * self.dt
-                obj_pred = obj_pos + obj_vel * t_pred
-
-                # Costs
-                L_ref = w_ref * np.sum((u_seq[k] - A_ref[k]) ** 2)
-                ee_pos = obs_k["robot0_eef_pos"]
-                L_goal = w_goal * np.sum((ee_pos - obj_pred) ** 2)
-                L_dyn = w_dyn * np.sum((ee_pos - obj_pred) ** 2)
-                L_reg = w_reg * np.sum(u_seq[k] ** 2)
-                L_obs = 0.0  # w_obs = 0 for now
-
-                J += L_ref + L_goal + L_dyn + L_reg + L_obs
-
+                p_obj_pred = p_obj + v_obj * t_pred
+                p_k = x[:3]
+                L_goal = w_goal * np.sum((p_k - p_obj_pred) ** 2)
+                L_ref = w_ref * np.sum((u_k - u_ref[k]) ** 2)
+                L_reg = w_reg * np.sum(u_k ** 2)
+                J += L_goal + L_ref + L_reg  # w_obs == 0
             costs[j] = J
 
-        # Restore original state
-        env.set_state(sim_state)
-        env.env.sim.forward()
-
-        # MPPI weighted update
         J_min = np.min(costs)
         weights = np.exp(-(costs - J_min) / max(self.temperature, 1e-6))
         weights = weights / (np.sum(weights) + 1e-8)
-        u_opt = np.sum(actions[:, 0] * weights[:, None], axis=0)
-        return u_opt
+        u0_new = u_ref[0] + np.sum(weights[:, None] * eps[:, 0, :], axis=0)
+        return u0_new
 
-    def _compute_phase(self, d: float, obs) -> str:
-        """
-        Simple 3-phase gating: approach / near / grasp.
-        """
-        if d > self.d_far:
-            return "approach"
-        if d > self.d_close:
+    def _dynamics_step(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
+        """x_{k+1} = [p + dp, aa + daa, g_cmd]"""
+        out = x.copy()
+        out[:3] = x[:3] + u[:3]
+        out[3:6] = x[3:6] + u[3:6]
+        out[6] = u[6]
+        return out
+
+    def _compute_phase(self, d: float, g_cmd: float) -> str:
+        if d <= self.d_close or g_cmd < -0.2:
+            return "grasp"
+        if d <= self.d_far:
             return "near"
-        return "grasp"
+        return "approach"
 
-    def _phase_weights_noise(self, phase: str) -> Tuple[float, float, float, float, float]:
-        # Start from base
-        w_ref = self.w_ref
+    def _phase_weights_noise(self, phase: str) -> Tuple[float, float, float, float]:
         w_goal = self.w_goal
-        w_dyn = self.w_dyn
+        w_ref = self.w_ref
         w_reg = self.w_reg
-        noise_sigma = self.base_noise_sigma
-
+        noise_scale = 1.0
         if phase == "approach":
-            # allow deviation to intercept moving target
-            w_ref *= 0.5
             w_goal *= 1.5
-            w_dyn *= 1.5
-            noise_sigma *= 1.5
+            w_ref *= 0.5
+            noise_scale *= 1.5
         elif phase == "near":
-            w_ref *= 2.0
             w_goal *= 1.0
-            w_dyn *= 1.0
-            noise_sigma *= 0.5
+            w_ref *= 2.0
+            noise_scale *= 0.5
         elif phase == "grasp":
-            w_ref *= 10.0
             w_goal *= 0.5
-            w_dyn *= 0.5
-            noise_sigma *= 0.1
-        return w_ref, w_goal, w_dyn, w_reg, noise_sigma
+            w_ref *= 10.0
+            noise_scale *= 0.1
+        return w_goal, w_ref, w_reg, noise_scale
 
 
 def eval_libero(args: Args) -> None:
@@ -244,21 +221,20 @@ def eval_libero(args: Args) -> None:
         # build MPPI once (need dt)
         if controller is None and args.use_mppi:
             dt = 1.0 / env.env.control_freq if hasattr(env.env, "control_freq") else env.env.sim.model.opt.timestep
-            controller = MPPILiberoController(
+            controller = EEFKinematicsMPPIController(
                 horizon=args.mppi_horizon,
                 num_samples=args.mppi_num_samples,
-                temperature=args.mppi_temperature,
+                dt=dt,
+                temperature=args.mppi_lambda,
                 base_noise_sigma=args.mppi_noise_sigma,
                 weights={
                     "w_ref": args.w_ref,
                     "w_goal": args.w_goal,
-                    "w_dyn": args.w_dyn,
                     "w_reg": args.w_reg,
                     "w_obs": args.w_obs,
                 },
                 d_far=args.d_far,
                 d_close=args.d_close,
-                dt=dt,
             )
 
         task_episodes, task_successes = 0, 0
@@ -329,14 +305,22 @@ def eval_libero(args: Args) -> None:
                     obj_vel = (curr_obj_pos - prev_obj_pos) / max(curr_time - prev_obj_time, 1e-6)
                     prev_obj_pos, prev_obj_time = curr_obj_pos, curr_time
 
-                    # Hybrid control: MPPI around A_ref[0]
+                    # Hybrid control: MPPI (kinematics) around A_ref
                     if args.use_mppi and controller is not None:
+                        x0 = np.concatenate(
+                            (
+                                obs["robot0_eef_pos"],
+                                _quat2axisangle(obs["robot0_eef_quat"]),
+                                np.array([np.mean(obs["robot0_gripper_qpos"])]),
+                            )
+                        )
+                        gripper_cmd_ref = float(A_ref[0][-1])
                         u_opt = controller.plan(
-                            env=env,
-                            obs=obs,
+                            x0=x0,
                             A_ref=A_ref,
-                            obj_pos=curr_obj_pos,
-                            obj_vel=obj_vel,
+                            p_obj=curr_obj_pos,
+                            v_obj=obj_vel,
+                            gripper_cmd_ref=gripper_cmd_ref,
                         )
                     else:
                         u_opt = action_plan[0]
