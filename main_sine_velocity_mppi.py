@@ -6,6 +6,7 @@ import pathlib
 from typing import List, Tuple
 
 import imageio
+import mujoco
 import numpy as np
 import tqdm
 import tyro
@@ -40,7 +41,10 @@ class Args:
     # MPPI on/off
     use_mppi: bool = True
 
-    # MPPI params (kinematics-only)
+    # MPPI mode
+    mppi_mode: str = "eef_kinematics"  # or "joint_torque"
+
+    # MPPI params (kinematics-only defaults)
     mppi_horizon: int = 10
     mppi_num_samples: int = 32
     mppi_lambda: float = 1.0  # temperature
@@ -49,6 +53,10 @@ class Args:
     w_goal: float = 5.0
     w_reg: float = 0.1
     w_obs: float = 0.0  # keep 0 for now
+
+    # Joint-torque MPPI options
+    w_tau: float = 0.05  # torque regularization
+    ee_body_name: str = "panda_hand"  # end-effector body/site name for FK/Jacobian
 
     # Phase thresholds (meters)
     d_far: float = 0.15
@@ -182,6 +190,149 @@ class EEFKinematicsMPPIController:
         return w_goal, w_ref, w_reg, noise_scale
 
 
+class JointTorqueMujocoMPPIController:
+    """Joint-torque MPPI using MuJoCo dynamics + FK for EEF tracking."""
+
+    def __init__(
+        self,
+        horizon: int,
+        num_samples: int,
+        dt: float,
+        temperature: float,
+        weights: dict,
+        d_far: float,
+        d_close: float,
+        sim,
+        ee_body_name: str,
+    ):
+        self.horizon = horizon
+        self.num_samples = num_samples
+        self.dt = dt
+        self.temperature = temperature
+        self.w_goal = weights["w_goal"]
+        self.w_ref = weights["w_ref"]
+        self.w_tau = weights["w_tau"]
+        self.w_obs = weights["w_obs"]
+        self.d_far = d_far
+        self.d_close = d_close
+        self.sim = sim
+        self.model = sim.model
+        self.data = sim.data
+        try:
+            self.ee_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, ee_body_name)
+        except Exception:
+            self.ee_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, ee_body_name)
+
+    def plan(
+        self,
+        q0: np.ndarray,
+        qdot0: np.ndarray,
+        A_ref: np.ndarray,
+        p_obj: np.ndarray,
+        v_obj: np.ndarray,
+        gripper_cmd_ref: float,
+    ) -> np.ndarray:
+        """
+        Returns:
+            tau_opt: (n_dof,) torque to send to env.step (assuming torque controller).
+        """
+        nv = self.model.nv
+        H_ref = A_ref.shape[0]
+        K = min(self.horizon, H_ref)
+
+        p_ee0 = self._get_ee_pos(q0, qdot0)
+        d = np.linalg.norm(p_ee0 - p_obj)
+        phase = self._compute_phase(d, gripper_cmd_ref)
+        w_goal, w_ref, w_tau, noise_scale = self._phase_weights_noise(phase)
+
+        if phase == "grasp":
+            return np.zeros(nv, dtype=np.float32)
+
+        p_ref = self._build_eef_ref(p_ee0, A_ref[:K, :3])
+
+        sigma_vec = np.ones(nv, dtype=np.float32) * self.dt * noise_scale
+        eps = np.random.normal(scale=sigma_vec, size=(self.num_samples, K, nv))
+        tau_ref = np.zeros((K, nv), dtype=np.float32)
+        costs = np.zeros(self.num_samples, dtype=np.float32)
+
+        for j in range(self.num_samples):
+            q = q0.copy()
+            qdot = qdot0.copy()
+            J = 0.0
+            for k in range(K):
+                tau_k = tau_ref[k] + eps[j, k]
+                q, qdot = self._dynamics_step(q, qdot, tau_k)
+                t_pred = (k + 1) * self.dt
+                p_obj_pred = p_obj + v_obj * t_pred
+                p_ee = self._get_ee_pos(q, qdot)
+
+                L_goal = w_goal * np.sum((p_ee - p_obj_pred) ** 2)
+                L_ref = w_ref * np.sum((p_ee - p_ref[k]) ** 2)
+                L_tau = w_tau * np.sum(tau_k ** 2)
+                J += L_goal + L_ref + L_tau
+            costs[j] = J
+
+        J_min = np.min(costs)
+        weights = np.exp(-(costs - J_min) / max(self.temperature, 1e-6))
+        weights = weights / (np.sum(weights) + 1e-8)
+        tau0_new = tau_ref[0] + np.sum(weights[:, None] * eps[:, 0, :], axis=0)
+        return tau0_new
+
+    def _dynamics_step(self, q, qdot, tau):
+        model, data = self.model, self.data
+        data.qpos[:] = q
+        data.qvel[:] = qdot
+        mujoco.mj_forward(model, data)
+        M = np.zeros((model.nv, model.nv), dtype=np.float64)
+        mujoco.mj_fullM(model, M, data.qM)
+        qddot = np.linalg.solve(M, tau - data.qfrc_bias)
+        q_next = q + qdot * self.dt
+        qdot_next = qdot + qddot * self.dt
+        return q_next, qdot_next
+
+    def _get_ee_pos(self, q, qdot):
+        data = self.data
+        data.qpos[:] = q
+        data.qvel[:] = qdot
+        mujoco.mj_forward(self.model, data)
+        return data.body_xpos[self.ee_body_id].copy()
+
+    def _build_eef_ref(self, p_start: np.ndarray, dp_seq: np.ndarray) -> np.ndarray:
+        K = dp_seq.shape[0]
+        prefs = np.zeros((K, 3), dtype=np.float32)
+        acc = p_start.copy()
+        for k in range(K):
+            acc = acc + dp_seq[k]
+            prefs[k] = acc
+        return prefs
+
+    def _compute_phase(self, d: float, g_cmd: float) -> str:
+        if d <= self.d_close or g_cmd < -0.2:
+            return "grasp"
+        if d <= self.d_far:
+            return "near"
+        return "approach"
+
+    def _phase_weights_noise(self, phase: str) -> Tuple[float, float, float, float]:
+        w_goal = self.w_goal
+        w_ref = self.w_ref
+        w_tau = self.w_tau
+        noise_scale = 1.0
+        if phase == "approach":
+            w_goal *= 1.5
+            w_ref *= 0.5
+            noise_scale *= 1.5
+        elif phase == "near":
+            w_goal *= 1.0
+            w_ref *= 2.0
+            noise_scale *= 0.5
+        elif phase == "grasp":
+            w_goal *= 0.5
+            w_ref *= 10.0
+            noise_scale *= 0.1
+        return w_goal, w_ref, w_tau, noise_scale
+
+
 def eval_libero(args: Args) -> None:
     np.random.seed(args.seed)
     _validate_motion_args(args)
@@ -221,21 +372,39 @@ def eval_libero(args: Args) -> None:
         # build MPPI once (need dt)
         if controller is None and args.use_mppi:
             dt = 1.0 / env.env.control_freq if hasattr(env.env, "control_freq") else env.env.sim.model.opt.timestep
-            controller = EEFKinematicsMPPIController(
-                horizon=args.mppi_horizon,
-                num_samples=args.mppi_num_samples,
-                dt=dt,
-                temperature=args.mppi_lambda,
-                base_noise_sigma=args.mppi_noise_sigma,
-                weights={
-                    "w_ref": args.w_ref,
-                    "w_goal": args.w_goal,
-                    "w_reg": args.w_reg,
-                    "w_obs": args.w_obs,
-                },
-                d_far=args.d_far,
-                d_close=args.d_close,
-            )
+            if args.mppi_mode == "joint_torque":
+                controller = JointTorqueMujocoMPPIController(
+                    horizon=args.mppi_horizon,
+                    num_samples=args.mppi_num_samples,
+                    dt=dt,
+                    temperature=args.mppi_lambda,
+                    weights={
+                        "w_ref": args.w_ref,
+                        "w_goal": args.w_goal,
+                        "w_tau": args.w_tau,
+                        "w_obs": args.w_obs,
+                    },
+                    d_far=args.d_far,
+                    d_close=args.d_close,
+                    sim=env.env.sim,
+                    ee_body_name=args.ee_body_name,
+                )
+            else:
+                controller = EEFKinematicsMPPIController(
+                    horizon=args.mppi_horizon,
+                    num_samples=args.mppi_num_samples,
+                    dt=dt,
+                    temperature=args.mppi_lambda,
+                    base_noise_sigma=args.mppi_noise_sigma,
+                    weights={
+                        "w_ref": args.w_ref,
+                        "w_goal": args.w_goal,
+                        "w_reg": args.w_reg,
+                        "w_obs": args.w_obs,
+                    },
+                    d_far=args.d_far,
+                    d_close=args.d_close,
+                )
 
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
@@ -315,13 +484,26 @@ def eval_libero(args: Args) -> None:
                             )
                         )
                         gripper_cmd_ref = float(A_ref[0][-1])
-                        u_opt = controller.plan(
-                            x0=x0,
-                            A_ref=A_ref,
-                            p_obj=curr_obj_pos,
-                            v_obj=obj_vel,
-                            gripper_cmd_ref=gripper_cmd_ref,
-                        )
+                        if isinstance(controller, JointTorqueMujocoMPPIController):
+                            # For torque MPPI, build joint state from sim
+                            q0 = env.env.sim.data.qpos.copy()
+                            qdot0 = env.env.sim.data.qvel.copy()
+                            u_opt = controller.plan(
+                                q0=q0,
+                                qdot0=qdot0,
+                                A_ref=A_ref,
+                                p_obj=curr_obj_pos,
+                                v_obj=obj_vel,
+                                gripper_cmd_ref=gripper_cmd_ref,
+                            )
+                        else:
+                            u_opt = controller.plan(
+                                x0=x0,
+                                A_ref=A_ref,
+                                p_obj=curr_obj_pos,
+                                v_obj=obj_vel,
+                                gripper_cmd_ref=gripper_cmd_ref,
+                            )
                     else:
                         u_opt = action_plan[0]
 
