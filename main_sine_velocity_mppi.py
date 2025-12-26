@@ -281,7 +281,7 @@ class JointTorqueMujocoMPPIController:
         model, data = self.model, self.data
         data.qpos[:] = q
         data.qvel[:] = qdot
-        mujoco.mj_forward(data)
+        mujoco.mj_forward(model, data)
         M = np.zeros((model.nv, model.nv), dtype=np.float64)
         mujoco.mj_fullM(model, M, data.qM)
         qddot = np.linalg.solve(M, tau - data.qfrc_bias)
@@ -293,7 +293,7 @@ class JointTorqueMujocoMPPIController:
         data = self.data
         data.qpos[:] = q
         data.qvel[:] = qdot
-        mujoco.mj_forward(data)
+        mujoco.mj_forward(self.model, data)
         if self.ee_is_site:
             return data.site_xpos[self.ee_body_id].copy()
         return data.body_xpos[self.ee_body_id].copy()
@@ -324,7 +324,7 @@ class JointTorqueMujocoMPPIController:
         data = self.data
         data.qpos[:] = q
         data.qvel[:] = qdot
-        mujoco.mj_forward(data)
+        mujoco.mj_forward(self.model, data)
         if self.ee_is_site:
             p_cur = data.site_xpos[self.ee_body_id].copy()
         else:
