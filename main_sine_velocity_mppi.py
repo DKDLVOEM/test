@@ -57,6 +57,8 @@ class Args:
     # Joint-torque MPPI options
     w_tau: float = 0.05  # torque regularization
     ee_body_name: str = "panda_hand"  # end-effector body/site name for FK/Jacobian
+    tau_kp: float = 200.0
+    tau_kd: float = 10.0
 
     # Phase thresholds (meters)
     d_far: float = 0.15
@@ -204,6 +206,8 @@ class JointTorqueMujocoMPPIController:
         d_close: float,
         sim,
         ee_body_name: str,
+        tau_kp: float,
+        tau_kd: float,
     ):
         self.horizon = horizon
         self.num_samples = num_samples
@@ -219,6 +223,8 @@ class JointTorqueMujocoMPPIController:
         self.model = sim.model
         self.data = sim.data
         self.ee_body_id, self.ee_is_site = self._resolve_ee_id(self.model, ee_body_name)
+        self.tau_kp = tau_kp
+        self.tau_kd = tau_kd
 
     def plan(
         self,
@@ -229,10 +235,6 @@ class JointTorqueMujocoMPPIController:
         v_obj: np.ndarray,
         gripper_cmd_ref: float,
     ) -> np.ndarray:
-        """
-        Returns:
-            tau_opt: (n_dof,) torque to send to env.step (assuming torque controller).
-        """
         nv = self.model.nv
         H_ref = A_ref.shape[0]
         K = min(self.horizon, H_ref)
@@ -246,10 +248,188 @@ class JointTorqueMujocoMPPIController:
             return np.zeros(nv, dtype=np.float32)
 
         p_ref = self._build_eef_ref(p_ee0, A_ref[:K, :3])
+        tau_ref = self._build_tau_ref(q0, qdot0, A_ref[:K])
 
         sigma_vec = np.ones(nv, dtype=np.float32) * self.dt * noise_scale
         eps = np.random.normal(scale=sigma_vec, size=(self.num_samples, K, nv))
+        costs = np.zeros(self.num_samples, dtype=np.float32)
+
+        for j in range(self.num_samples):
+            q = q0.copy()
+            qdot = qdot0.copy()
+            J = 0.0
+            for k in range(K):
+                tau_k = tau_ref[k] + eps[j, k]
+                q, qdot = self._dynamics_step(q, qdot, tau_k)
+                t_pred = (k + 1) * self.dt
+                p_obj_pred = p_obj + v_obj * t_pred
+                p_ee = self._get_ee_pos(q, qdot)
+
+                L_goal = w_goal * np.sum((p_ee - p_obj_pred) ** 2)
+                L_ref = w_ref * np.sum((p_ee - p_ref[k]) ** 2)
+                L_tau = w_tau * np.sum(tau_k ** 2)
+                J += L_goal + L_ref + L_tau  # w_obs == 0
+            costs[j] = J
+
+        J_min = np.min(costs)
+        weights = np.exp(-(costs - J_min) / max(self.temperature, 1e-6))
+        weights = weights / (np.sum(weights) + 1e-8)
+        tau0_new = tau_ref[0] + np.sum(weights[:, None] * eps[:, 0, :], axis=0)
+        return tau0_new
+
+    def _dynamics_step(self, q, qdot, tau):
+        model, data = self.model, self.data
+        data.qpos[:] = q
+        data.qvel[:] = qdot
+        mujoco.mj_forward(model, data)
+        M = np.zeros((model.nv, model.nv), dtype=np.float64)
+        mujoco.mj_fullM(model, M, data.qM)
+        qddot = np.linalg.solve(M, tau - data.qfrc_bias)
+        q_next = q + qdot * self.dt
+        qdot_next = qdot + qddot * self.dt
+        return q_next, qdot_next
+
+    def _get_ee_pos(self, q, qdot):
+        data = self.data
+        data.qpos[:] = q
+        data.qvel[:] = qdot
+        mujoco.mj_forward(self.model, data)
+        if self.ee_is_site:
+            return data.site_xpos[self.ee_body_id].copy()
+        return data.body_xpos[self.ee_body_id].copy()
+
+    def _build_eef_ref(self, p_start: np.ndarray, dp_seq: np.ndarray) -> np.ndarray:
+        K = dp_seq.shape[0]
+        prefs = np.zeros((K, 3), dtype=np.float32)
+        acc = p_start.copy()
+        for k in range(K):
+            acc = acc + dp_seq[k]
+            prefs[k] = acc
+        return prefs
+
+    def _build_tau_ref(self, q0: np.ndarray, qdot0: np.ndarray, A_ref: np.ndarray) -> np.ndarray:
+        nv = self.model.nv
+        K = A_ref.shape[0]
         tau_ref = np.zeros((K, nv), dtype=np.float32)
+        q = q0.copy()
+        qdot = qdot0.copy()
+        for k in range(K):
+            dp_ref = A_ref[k, :3]
+            tau_k = self._eef_delta_to_tau(q, qdot, dp_ref)
+            tau_ref[k] = tau_k
+            q, qdot = self._dynamics_step(q, qdot, tau_k)
+        return tau_ref
+
+    def _eef_delta_to_tau(self, q: np.ndarray, qdot: np.ndarray, dp: np.ndarray) -> np.ndarray:
+        data = self.data
+        data.qpos[:] = q
+        data.qvel[:] = qdot
+        mujoco.mj_forward(self.model, data)
+        if self.ee_is_site:
+            p_cur = data.site_xpos[self.ee_body_id].copy()
+        else:
+            p_cur = data.body_xpos[self.ee_body_id].copy()
+        jacp = np.zeros((3, self.model.nv))
+        jacr = np.zeros((3, self.model.nv))
+        if self.ee_is_site:
+            mujoco.mj_jacSite(self.model, data, jacp, jacr, self.ee_body_id)
+        else:
+            mujoco.mj_jacBody(self.model, data, jacp, jacr, self.ee_body_id)
+        v_ee = jacp @ qdot
+        p_des = p_cur + dp
+        err = p_des - p_cur
+        F = self.tau_kp * err - self.tau_kd * v_ee
+        tau = jacp.T @ F
+        return tau.astype(np.float32)
+
+    def _resolve_ee_id(self, model, name_hint):
+        try:
+            bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name_hint)
+            return bid, False
+        except Exception:
+            pass
+        try:
+            sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name_hint)
+            return sid, True
+        except Exception:
+            pass
+        name_hint_l = name_hint.lower()
+        for idx in range(model.nbody):
+            n = model.body_id2name(idx)
+            if n and any(key in n.lower() for key in ["hand", "gripper", "eef", name_hint_l]):
+                return idx, False
+        for idx in range(model.nsite):
+            n = model.site_id2name(idx)
+            if n and any(key in n.lower() for key in ["hand", "gripper", "eef", name_hint_l]):
+                return idx, True
+        return 0, False
+
+
+class JointTorqueMujocoMPPIController:
+    """Joint-torque MPPI using MuJoCo dynamics + FK for EEF tracking."""
+
+    def __init__(
+        self,
+        horizon: int,
+        num_samples: int,
+        dt: float,
+        temperature: float,
+        weights: dict,
+        d_far: float,
+        d_close: float,
+        sim,
+        ee_body_name: str,
+        tau_kp: float,
+        tau_kd: float,
+    ):
+        self.horizon = horizon
+        self.num_samples = num_samples
+        self.dt = dt
+        self.temperature = temperature
+        self.w_goal = weights["w_goal"]
+        self.w_ref = weights["w_ref"]
+        self.w_tau = weights["w_tau"]
+        self.w_obs = weights["w_obs"]
+        self.d_far = d_far
+        self.d_close = d_close
+        self.sim = sim
+        self.model = sim.model
+        self.data = sim.data
+        self.ee_body_id, self.ee_is_site = self._resolve_ee_id(self.model, ee_body_name)
+        self.tau_kp = tau_kp
+        self.tau_kd = tau_kd
+
+    def plan(
+        self,
+        q0: np.ndarray,
+        qdot0: np.ndarray,
+        A_ref: np.ndarray,
+        p_obj: np.ndarray,
+        v_obj: np.ndarray,
+        gripper_cmd_ref: float,
+    ) -> np.ndarray:
+        """
+        Returns:
+            delta_chunk: (K,7) delta-EEF+gripper sequence mapped from torque plan (first element used for env.step).
+        """
+        nv = self.model.nv
+        H_ref = A_ref.shape[0]
+        K = min(self.horizon, H_ref)
+
+        p_ee0 = self._get_ee_pos(q0, qdot0)
+        d = np.linalg.norm(p_ee0 - p_obj)
+        phase = self._compute_phase(d, gripper_cmd_ref)
+        w_goal, w_ref, w_tau, noise_scale = self._phase_weights_noise(phase)
+
+        if phase == "grasp":
+            # Follow pi0 directly in grasp
+            return A_ref[:K]
+
+        p_ref = self._build_eef_ref(p_ee0, A_ref[:K, :3])
+        tau_ref = self._build_tau_ref(q0, qdot0, A_ref[:K])
+
+        sigma_vec = np.ones(nv, dtype=np.float32) * self.dt * noise_scale
+        eps = np.random.normal(scale=sigma_vec, size=(self.num_samples, K, nv))
         costs = np.zeros(self.num_samples, dtype=np.float32)
 
         for j in range(self.num_samples):
@@ -272,8 +452,23 @@ class JointTorqueMujocoMPPIController:
         J_min = np.min(costs)
         weights = np.exp(-(costs - J_min) / max(self.temperature, 1e-6))
         weights = weights / (np.sum(weights) + 1e-8)
-        tau0_new = tau_ref[0] + np.sum(weights[:, None] * eps[:, 0, :], axis=0)
-        return tau0_new
+        tau_new = tau_ref + np.sum(weights[:, None, None] * eps, axis=0)  # (K,nv)
+
+        # Rollout deterministically with tau_new to build delta-EEF chunk
+        delta_chunk = np.zeros((K, 7), dtype=np.float32)
+        q = q0.copy()
+        qdot = qdot0.copy()
+        p_prev = p_ee0.copy()
+        for k in range(K):
+            q, qdot = self._dynamics_step(q, qdot, tau_new[k])
+            p_curr = self._get_ee_pos(q, qdot)
+            delta_pos = p_curr - p_prev
+            delta_ori = A_ref[k][3:6]  # keep pi0 orientation delta as-is
+            gripper_cmd = A_ref[k][-1]
+            delta_chunk[k] = np.concatenate([delta_pos, delta_ori, [gripper_cmd]])
+            p_prev = p_curr
+
+        return delta_chunk
 
     def _dynamics_step(self, q, qdot, tau):
         model, data = self.model, self.data
@@ -415,6 +610,8 @@ def eval_libero(args: Args) -> None:
                     d_close=args.d_close,
                     sim=env.env.sim,
                     ee_body_name=args.ee_body_name,
+                    tau_kp=args.tau_kp,
+                    tau_kd=args.tau_kd,
                 )
             else:
                 controller = EEFKinematicsMPPIController(
@@ -451,9 +648,13 @@ def eval_libero(args: Args) -> None:
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
                 try:
-                    # let objects fall initially
+                    # let objects fall initially; use controller-appropriate dummy
                     if t < args.num_steps_wait:
-                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                        if args.mppi_mode == "joint_torque":
+                            dummy = np.zeros(env.env.sim.model.nv, dtype=np.float32)
+                        else:
+                            dummy = LIBERO_DUMMY_ACTION
+                        obs, reward, done, info = env.step(dummy)
                         t += 1
                         continue
 
@@ -515,7 +716,7 @@ def eval_libero(args: Args) -> None:
                             # For torque MPPI, build joint state from sim
                             q0 = env.env.sim.data.qpos.copy()
                             qdot0 = env.env.sim.data.qvel.copy()
-                            u_opt = controller.plan(
+                            delta_chunk = controller.plan(
                                 q0=q0,
                                 qdot0=qdot0,
                                 A_ref=A_ref,
@@ -523,6 +724,9 @@ def eval_libero(args: Args) -> None:
                                 v_obj=obj_vel,
                                 gripper_cmd_ref=gripper_cmd_ref,
                             )
+                            action_plan.clear()
+                            action_plan.extend([d.tolist() for d in delta_chunk])
+                            u_opt = action_plan.popleft()
                         else:
                             u_opt = controller.plan(
                                 x0=x0,
