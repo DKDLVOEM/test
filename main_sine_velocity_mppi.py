@@ -281,7 +281,7 @@ class JointTorqueMujocoMPPIController:
         model, data = self.model, self.data
         data.qpos[:] = q
         data.qvel[:] = qdot
-        mujoco.mj_forward(model, data)
+        mujoco.mj_forward(data)
         M = np.zeros((model.nv, model.nv), dtype=np.float64)
         mujoco.mj_fullM(model, M, data.qM)
         qddot = np.linalg.solve(M, tau - data.qfrc_bias)
@@ -293,7 +293,7 @@ class JointTorqueMujocoMPPIController:
         data = self.data
         data.qpos[:] = q
         data.qvel[:] = qdot
-        mujoco.mj_forward(self.model, data)
+        mujoco.mj_forward(data)
         if self.ee_is_site:
             return data.site_xpos[self.ee_body_id].copy()
         return data.body_xpos[self.ee_body_id].copy()
@@ -324,7 +324,7 @@ class JointTorqueMujocoMPPIController:
         data = self.data
         data.qpos[:] = q
         data.qvel[:] = qdot
-        mujoco.mj_forward(self.model, data)
+        mujoco.mj_forward(data)
         if self.ee_is_site:
             p_cur = data.site_xpos[self.ee_body_id].copy()
         else:
@@ -648,13 +648,9 @@ def eval_libero(args: Args) -> None:
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
                 try:
-                    # let objects fall initially; use controller-appropriate dummy
+                    # let objects fall initially
                     if t < args.num_steps_wait:
-                        if args.mppi_mode == "joint_torque":
-                            dummy = np.zeros(env.env.sim.model.nv, dtype=np.float32)
-                        else:
-                            dummy = LIBERO_DUMMY_ACTION
-                        obs, reward, done, info = env.step(dummy)
+                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
                         t += 1
                         continue
 
