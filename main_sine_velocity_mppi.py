@@ -218,10 +218,7 @@ class JointTorqueMujocoMPPIController:
         self.sim = sim
         self.model = sim.model
         self.data = sim.data
-        try:
-            self.ee_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, ee_body_name)
-        except Exception:
-            self.ee_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, ee_body_name)
+        self.ee_body_id, self.ee_is_site = self._resolve_ee_id(self.model, ee_body_name)
 
     def plan(
         self,
@@ -295,7 +292,37 @@ class JointTorqueMujocoMPPIController:
         data.qpos[:] = q
         data.qvel[:] = qdot
         mujoco.mj_forward(self.model, data)
+        if self.ee_is_site:
+            return data.site_xpos[self.ee_body_id].copy()
         return data.body_xpos[self.ee_body_id].copy()
+
+    def _resolve_ee_id(self, model, name_hint):
+        """Resolve end-effector id; try body, then site, then fuzzy match."""
+        # direct try: body
+        try:
+            bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name_hint)
+            return bid, False
+        except Exception:
+            pass
+        # direct try: site
+        try:
+            sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name_hint)
+            return sid, True
+        except Exception:
+            pass
+        # fuzzy search bodies
+        name_hint_l = name_hint.lower()
+        for idx in range(model.nbody):
+            n = model.body_id2name(idx)
+            if n and any(key in n.lower() for key in ["hand", "gripper", "eef", name_hint_l]):
+                return idx, False
+        # fuzzy search sites
+        for idx in range(model.nsite):
+            n = model.site_id2name(idx)
+            if n and any(key in n.lower() for key in ["hand", "gripper", "eef", name_hint_l]):
+                return idx, True
+        # fallback: body 0
+        return 0, False
 
     def _build_eef_ref(self, p_start: np.ndarray, dp_seq: np.ndarray) -> np.ndarray:
         K = dp_seq.shape[0]
