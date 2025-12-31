@@ -9,27 +9,28 @@ import imageio
 import numpy as np
 import tqdm
 import tyro
-
+import mujoco  # fallback용으로 사용 (jacobian 계산 등)
 from libero.libero import benchmark
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 
-
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
 
+# ======================================================================
+# Args
+# ======================================================================
+
 @dataclasses.dataclass
 class Args:
-    # Model server parameters
     host: str = "0.0.0.0"
     port: int = 8000
     resize_size: int = 224
     replan_steps: int = 5
 
-    # LIBERO environment-specific parameters
     task_suite_name: str = "libero_spatial"
     num_steps_wait: int = 10
     num_trials_per_task: int = 50
@@ -50,7 +51,7 @@ class Args:
     # MPPI params (kinematics-only defaults)
     mppi_horizon: int = 10
     mppi_num_samples: int = 32
-    mppi_lambda: float = 1.0  # temperature λ
+    mppi_lambda: float = 1.0  # temperature
     mppi_noise_sigma: float = 0.02  # base sigma for xyz / orient; gripper noise scaled down
     w_ref: float = 1.0
     w_goal: float = 5.0
@@ -67,10 +68,13 @@ class Args:
     d_far: float = 0.15
     d_close: float = 0.04
 
-    # Utils
     video_out_path: str = "data/libero/videos"
     seed: int = 7  # Random Seed (for reproducibility)
 
+
+# ======================================================================
+# EEF Kinematics-only MPPI
+# ======================================================================
 
 class EEFKinematicsMPPIController:
     """Kinematics-only MPPI around pi0 action reference (no MuJoCo rollouts)."""
@@ -196,13 +200,19 @@ class EEFKinematicsMPPIController:
         return w_goal, w_ref, w_reg, noise_scale
 
 
+# ======================================================================
+# Joint Torque MPPI (Franka 7-DOF 중심, 선형화 기반)
+# ======================================================================
+
 class JointTorqueMujocoMPPIController:
     """
-    Joint-torque MPPI using MuJoCo dynamics (approximate) + FK for EEF tracking.
+    Joint-torque MPPI using a simple joint-space dynamics model:
+      q_{k+1}   = q_k   + dt * qdot_k
+      qdot_{k+1}= qdot_k+ dt * qddot_k,  qddot_k ≈ tau_k   (M = I 근사)
 
-    - Control dimension: 7 (Franka arm DOFs)
-    - Internal dynamics: full nv-state, but qddot for arm DOFs만 사용
-      qddot_arm ≈ (tau_arm - bias_arm) * dof_invweight0_arm (diagonal M approximation)
+    EEF 위치는 시작 시점에서 구한 (p0, J0)를 사용해
+      p(q) ≈ p0 + J0 (q - q0)
+    로 선형화해서 계산.
     """
 
     def __init__(
@@ -224,142 +234,126 @@ class JointTorqueMujocoMPPIController:
         self.num_samples = num_samples
         self.dt = dt
         self.temperature = temperature
+
         self.w_goal = weights["w_goal"]
         self.w_ref = weights["w_ref"]
         self.w_tau = weights["w_tau"]
         self.w_obs = weights["w_obs"]
+
         self.d_far = d_far
         self.d_close = d_close
 
         self.sim = sim
-        self.model = sim.model
-        self.data = sim.data
         self.robot = robot
+        self.model = getattr(sim, "model", None)
+        self.data = getattr(sim, "data", None)
 
-        # ---- Arm DOF 인덱스 설정 (7 DOF 기준) ----
-        # robosuite Robot이 보통 다음 속성을 가짐:
-        #   - arm_dof
-        #   - _ref_joint_vel_indexes
-        #   - _ref_joint_pos_indexes
-        if hasattr(robot, "arm_dof"):
-            self.arm_dof = robot.arm_dof
+        # Robot DOF (Franka arm = 7)
+        self.ndof = int(robot.dof)
+
+        # robosuite에서 joint index (global qpos/qvel index) 가져오기
+        # (버전에 따라 _ref_joint_pos_indexes / _ref_joint_vel_indexes 가 다를 수 있음)
+        self.jnt_pos_idx = np.array(getattr(robot, "_ref_joint_pos_indexes"), dtype=int)
+        self.jnt_vel_idx = np.array(getattr(robot, "_ref_joint_vel_indexes"), dtype=int)
+
+        # EEF 이름
+        if ee_name is not None and len(ee_name) > 0:
+            self.ee_name = ee_name
         else:
-            # fallback
-            self.arm_dof = 7
+            # robosuite Robot에 보통 eef_site_name / eef_link_name 등이 있음
+            self.ee_name = getattr(robot, "eef_site_name", getattr(robot, "eef_link_name", None))
 
-        if hasattr(robot, "_ref_joint_vel_indexes"):
-            self.arm_vel_idx = np.array(robot._ref_joint_vel_indexes, dtype=int)
-        elif hasattr(robot, "joint_indexes"):
-            self.arm_vel_idx = np.array(robot.joint_indexes, dtype=int)
-        else:
-            self.arm_vel_idx = np.arange(self.arm_dof, dtype=int)
-
-        if hasattr(robot, "_ref_joint_pos_indexes"):
-            self.arm_pos_idx = np.array(robot._ref_joint_pos_indexes, dtype=int)
-        else:
-            self.arm_pos_idx = self.arm_vel_idx
-
-        # ---- EE name → site / body index resolve (mujoco.* 호출 없이) ----
-        self.ee_is_site = True
-        self.ee_site_id = None
-        self.ee_body_id = None
-        try:
-            self.ee_site_id = self.model.site_name2id(ee_name)
-            self.ee_is_site = True
-        except Exception:
-            try:
-                self.ee_body_id = self.model.body_name2id(ee_name)
-                self.ee_is_site = False
-            except Exception:
-                raise ValueError(f"EE name '{ee_name}' not found as site or body in the model.")
-
-        # ---- 대각 mass 근사용 inverse mass (dof_invweight0 사용) ----
-        # MuJoCo에서 dof_invweight0는 대략 M^{-1}의 대각 성분에 해당.
-        if hasattr(self.model, "dof_invweight0"):
-            dof_inv = np.array(self.model.dof_invweight0, copy=True)
-            self.arm_inv_mass = dof_inv[self.arm_vel_idx]
-        else:
-            # fallback: 단위 질량
-            self.arm_inv_mass = np.ones(self.arm_dof, dtype=np.float64)
-
+        # task-space PD gains
         self.tau_kp = tau_kp
         self.tau_kd = tau_kd
 
-    # --------------------------------------------------------------------------
-    # Public MPPI interface
-    # --------------------------------------------------------------------------
+        # linearization holders
+        self._p0 = None          # (3,)
+        self._q0_arm = None      # (7,)
+        self._J0 = None          # (3,7)
+
+    # ------------------------ public API ------------------------ #
+
     def plan(
         self,
-        q0: np.ndarray,
-        qdot0: np.ndarray,
+        q0_full: np.ndarray,
+        qdot0_full: np.ndarray,
         A_ref: np.ndarray,
         p_obj: np.ndarray,
         v_obj: np.ndarray,
         gripper_cmd_ref: float,
     ) -> np.ndarray:
         """
+        Args:
+            q0_full, qdot0_full: full MuJoCo state (nv-sized), from env.env.sim.data
+            A_ref: [H,7] VLA reference actions (delta-pos/orient/gripper)
+            p_obj, v_obj: object position / velocity
         Returns:
             delta_chunk: (K,7) delta-EEF+gripper sequence mapped from torque plan
-                         (first element used for env.step).
         """
         H_ref = A_ref.shape[0]
         K = min(self.horizon, H_ref)
 
-        # 현재 EE 포즈
-        p_ee0 = self._get_ee_pos(q0, qdot0)
+        # 현재 EEF 위치 (진짜 sim에서 한 번만 읽음)
+        p_ee0 = self._get_ee_pos_from_sim(q0_full, qdot0_full)
         d = np.linalg.norm(p_ee0 - p_obj)
         phase = self._compute_phase(d, gripper_cmd_ref)
         w_goal, w_ref, w_tau, noise_scale = self._phase_weights_noise(phase)
 
-        # grasp phase: 그냥 pi0 따라가기
+        # grasp phase면 그냥 pi0 따라가기
         if phase == "grasp":
             return A_ref[:K]
 
-        # EEF reference trajectory (월드좌표)
+        # 선형화 세팅: p0, q0_arm, J0
+        self._setup_linearization(q0_full, qdot0_full)
+
+        q0_arm = q0_full[self.jnt_pos_idx]
+        qdot0_arm = qdot0_full[self.jnt_vel_idx]
+
+        # reference trajectory in EEF space (누적된 delta pos)
         p_ref = self._build_eef_ref(p_ee0, A_ref[:K, :3])
+        # reference torque sequence (feedforward용)
+        tau_ref = self._build_tau_ref(q0_arm, qdot0_arm, A_ref[:K])
 
-        # tau_ref: EEF delta → tau_arm (7)
-        tau_ref = self._build_tau_ref(q0, qdot0, A_ref[:K])
-
-        # Noise in tau space (7 DOF)
-        nu = self.arm_dof  # 7
-        sigma_vec = np.ones(nu, dtype=np.float32) * self.dt * noise_scale
-        eps = np.random.normal(scale=sigma_vec, size=(self.num_samples, K, nu))
+        # noise: joint torque space (ndof)
+        sigma_vec = np.ones(self.ndof, dtype=np.float32) * self.dt * noise_scale
+        eps = np.random.normal(scale=sigma_vec, size=(self.num_samples, K, self.ndof))
         costs = np.zeros(self.num_samples, dtype=np.float32)
 
-        # -------------------- MPPI rollouts --------------------
+        # MPPI sampling
         for j in range(self.num_samples):
-            q = q0.copy()
-            qdot = qdot0.copy()
+            q = q0_arm.copy()
+            qdot = qdot0_arm.copy()
             J_cost = 0.0
             for k in range(K):
-                tau_k = tau_ref[k] + eps[j, k]  # (7,)
-
+                tau_k = tau_ref[k] + eps[j, k]
                 q, qdot = self._dynamics_step(q, qdot, tau_k)
+
                 t_pred = (k + 1) * self.dt
                 p_obj_pred = p_obj + v_obj * t_pred
-                p_ee = self._get_ee_pos(q, qdot)
+                p_ee = self._eef_pos_linear(q)
 
                 L_goal = w_goal * np.sum((p_ee - p_obj_pred) ** 2)
                 L_ref = w_ref * np.sum((p_ee - p_ref[k]) ** 2)
-                L_tau = w_tau * np.sum(tau_k**2)
+                L_tau = w_tau * np.sum(tau_k ** 2)
+
                 J_cost += L_goal + L_ref + L_tau
             costs[j] = J_cost
 
-        # -------------------- Weighting & update --------------------
         J_min = np.min(costs)
         weights = np.exp(-(costs - J_min) / max(self.temperature, 1e-6))
         weights = weights / (np.sum(weights) + 1e-8)
-        tau_new = tau_ref + np.sum(weights[:, None, None] * eps, axis=0)  # (K,7)
 
-        # -------------------- Deterministic rollout → delta-EEF chunk --------------------
+        tau_new = tau_ref + np.sum(weights[:, None, None] * eps, axis=0)  # (K, ndof)
+
+        # deterministic rollout으로 delta-EEF chunk 생성
         delta_chunk = np.zeros((K, 7), dtype=np.float32)
-        q = q0.copy()
-        qdot = qdot0.copy()
+        q = q0_arm.copy()
+        qdot = qdot0_arm.copy()
         p_prev = p_ee0.copy()
         for k in range(K):
             q, qdot = self._dynamics_step(q, qdot, tau_new[k])
-            p_curr = self._get_ee_pos(q, qdot)
+            p_curr = self._eef_pos_linear(q)
             delta_pos = p_curr - p_prev
             delta_ori = A_ref[k][3:6]  # orientation delta는 pi0 그대로 사용
             gripper_cmd = A_ref[k][-1]
@@ -368,131 +362,174 @@ class JointTorqueMujocoMPPIController:
 
         return delta_chunk
 
-    # --------------------------------------------------------------------------
-    # Internal dynamics & kinematics
-    # --------------------------------------------------------------------------
-    def _dynamics_step(self, q, qdot, tau_arm):
+    # ------------------------ internal helpers ------------------------ #
+
+    def _setup_linearization(self, q_full: np.ndarray, qdot_full: np.ndarray):
+        """현재 상태에서 p0, q0_arm, J0(3x7) 계산."""
+        self._q0_arm = q_full[self.jnt_pos_idx].copy()
+        self._p0 = self._get_ee_pos_from_sim(q_full, qdot_full)
+        self._J0 = self._get_task_jacobian(q_full, qdot_full)
+
+    def _get_ee_pos_from_sim(self, q_full: np.ndarray, qdot_full: np.ndarray) -> np.ndarray:
         """
-        q (nv,), qdot (nv,), tau_arm (7,)
-        - MuJoCo 전체 자유도 중 arm_vel_idx에만 torque 적용
-        - qddot_arm ≈ (tau_arm - bias_arm) * dof_invweight0_arm (대각 근사)
+        sim의 model/data를 잠깐 덮어써서 EEF position 읽고, 바로 원래 상태 복원.
         """
-        model, data = self.model, self.data
+        if self.model is None or self.data is None:
+            # robosuite Robot API가 있으면 그걸 쓰는 것도 가능
+            if hasattr(self.robot, "ee_pose"):
+                pos, _ = self.robot.ee_pose()
+                return np.array(pos, dtype=np.float32)
+            raise RuntimeError("No model/data in sim to get ee position.")
 
-        # 현재 상태 세팅
-        data.qpos[:] = q
-        data.qvel[:] = qdot
-        self.sim.forward()
+        # snapshot
+        qpos_backup = self.data.qpos.copy()
+        qvel_backup = self.data.qvel.copy()
 
-        # full bias (nv)
-        bias_full = np.array(data.qfrc_bias, copy=True)
+        try:
+            self.data.qpos[:] = q_full
+            self.data.qvel[:] = qdot_full
+            if hasattr(self.sim, "forward"):
+                self.sim.forward()
 
-        # arm DOF에 대한 qddot 근사
-        bias_arm = bias_full[self.arm_vel_idx]  # (7,)
-        qddot_arm = (tau_arm - bias_arm) * self.arm_inv_mass  # (7,)
+            # site 우선
+            pos = None
+            if hasattr(self.model, "site_name2id"):
+                try:
+                    sid = self.model.site_name2id(self.ee_name)
+                    pos = self.data.site_xpos[sid]
+                except Exception:
+                    pos = None
+            if pos is None and hasattr(self.model, "body_name2id"):
+                bid = self.model.body_name2id(self.ee_name)
+                pos = self.data.body_xpos[bid]
+            if pos is None:
+                raise RuntimeError(f"Cannot find ee site/body with name {self.ee_name}")
+            return np.array(pos, dtype=np.float32)
+        finally:
+            # restore
+            self.data.qpos[:] = qpos_backup
+            self.data.qvel[:] = qvel_backup
+            if hasattr(self.sim, "forward"):
+                self.sim.forward()
 
-        qddot_full = np.zeros_like(qdot)
-        qddot_full[self.arm_vel_idx] = qddot_arm
-
-        # simple Euler integration
-        q_next = q + qdot * self.dt
-        qdot_next = qdot + qddot_full * self.dt
-        return q_next, qdot_next
-
-    def _get_ee_pos_from_state(self):
-        if self.ee_is_site and self.ee_site_id is not None:
-            return self.data.site_xpos[self.ee_site_id].copy()
-        elif (not self.ee_is_site) and self.ee_body_id is not None:
-            return self.data.body_xpos[self.ee_body_id].copy()
-        else:
-            raise RuntimeError("EE id not resolved properly.")
-
-    def _get_ee_pos(self, q, qdot):
-        data = self.data
-        data.qpos[:] = q
-        data.qvel[:] = qdot
-        self.sim.forward()
-        return self._get_ee_pos_from_state()
-
-    def _compute_pos_jacobian_fd(self, q, qdot, eps: float = 1e-4) -> np.ndarray:
+    def _get_task_jacobian(self, q_full: np.ndarray, qdot_full: np.ndarray) -> np.ndarray:
         """
-        Finite-difference로 EEF position Jacobian J ∈ R^{3x7} 계산.
-        - arm_pos_idx를 이용해서 각 joint qpos를 ±eps perturb.
-        - mujoco.mj_jacSite / mj_jacBody 사용하지 않음.
+        EEF Jacobian J0 (3x7) 계산.
+        1) 가능하면 robosuite Robot API 사용
+        2) 안 되면 mujoco.mj_jacSite / mj_jacBody fallback
         """
-        data = self.data
+        # (1) robosuite Robot method 시도
+        if hasattr(self.robot, "jacobian"):
+            try:
+                J6 = self.robot.jacobian(self.ee_name)  # (6, ndof) 가정
+                return np.array(J6[:3, :self.ndof], dtype=np.float32)
+            except Exception:
+                pass
+        if hasattr(self.robot, "robot_jacobian"):
+            try:
+                J6 = self.robot.robot_jacobian(self.ee_name)
+                return np.array(J6[:3, :self.ndof], dtype=np.float32)
+            except Exception:
+                pass
 
-        # base state
-        data.qpos[:] = q
-        data.qvel[:] = qdot
-        self.sim.forward()
-        p0 = self._get_ee_pos_from_state()
+        # (2) mujoco low-level fallback
+        if self.model is None or self.data is None:
+            raise RuntimeError("Cannot compute Jacobian: no model/data and no robot jacobian method.")
 
-        J = np.zeros((3, self.arm_dof), dtype=np.float64)
+        # snapshot
+        qpos_backup = self.data.qpos.copy()
+        qvel_backup = self.data.qvel.copy()
 
-        for j in range(self.arm_dof):
-            qi = int(self.arm_pos_idx[j])
+        try:
+            self.data.qpos[:] = q_full
+            self.data.qvel[:] = qdot_full
+            if hasattr(self.sim, "forward"):
+                self.sim.forward()
 
-            # +eps
-            data.qpos[qi] = q[qi] + eps
-            self.sim.forward()
-            p_plus = self._get_ee_pos_from_state()
+            jacp = np.zeros((3, self.model.nv), dtype=np.float64)
+            jacr = np.zeros((3, self.model.nv), dtype=np.float64)
 
-            # -eps
-            data.qpos[qi] = q[qi] - eps
-            self.sim.forward()
-            p_minus = self._get_ee_pos_from_state()
+            # site 우선 시도
+            use_site = True
+            sid = -1
+            if hasattr(self.model, "site_name2id"):
+                try:
+                    sid = self.model.site_name2id(self.ee_name)
+                except Exception:
+                    use_site = False
 
-            # reset
-            data.qpos[qi] = q[qi]
+            if use_site and sid >= 0:
+                mujoco.mj_jacSite(self.model, self.data, jacp, jacr, sid)
+            else:
+                # body fallback
+                bid = self.model.body_name2id(self.ee_name)
+                mujoco.mj_jacBody(self.model, self.data, jacp, jacr, bid)
 
-            J[:, j] = (p_plus - p_minus) / (2.0 * eps)
+            # joint DOF(7개)에 해당하는 column만 추출
+            Jpos_arm = jacp[:, self.jnt_vel_idx]
+            return np.array(Jpos_arm, dtype=np.float32)
 
-        # restore base
-        data.qpos[:] = q
-        data.qvel[:] = qdot
-        self.sim.forward()
-        return J
+        finally:
+            self.data.qpos[:] = qpos_backup
+            self.data.qvel[:] = qvel_backup
+            if hasattr(self.sim, "forward"):
+                self.sim.forward()
 
-    def _build_tau_ref(self, q0: np.ndarray, qdot0: np.ndarray, A_ref: np.ndarray) -> np.ndarray:
-        K = A_ref.shape[0]
-        tau_ref = np.zeros((K, self.arm_dof), dtype=np.float32)
-        q = q0.copy()
-        qdot = qdot0.copy()
+    def _eef_pos_linear(self, q_arm: np.ndarray) -> np.ndarray:
+        """p(q) ≈ p0 + J0 (q - q0)."""
+        return self._p0 + self._J0 @ (q_arm - self._q0_arm)
+
+    def _build_eef_ref(self, p_start: np.ndarray, dp_seq: np.ndarray) -> np.ndarray:
+        """pi0 delta-pos 누적해서 absolute EEF reference trajectory 생성."""
+        K = dp_seq.shape[0]
+        prefs = np.zeros((K, 3), dtype=np.float32)
+        acc = p_start.copy()
         for k in range(K):
-            dp_ref = A_ref[k, :3]
-            tau_k = self._eef_delta_to_tau(q, qdot, dp_ref)  # (7,)
+            acc = acc + dp_seq[k]
+            prefs[k] = acc
+        return prefs
+
+    def _build_tau_ref(self, q0_arm: np.ndarray, qdot0_arm: np.ndarray, A_ref: np.ndarray) -> np.ndarray:
+        """
+        A_ref의 delta-pos를 이용해서 task-space PD + J0^T 를 거친 feedforward torque 시퀀스 생성.
+        """
+        K = A_ref.shape[0]
+        tau_ref = np.zeros((K, self.ndof), dtype=np.float32)
+
+        q = q0_arm.copy()
+        qdot = qdot0_arm.copy()
+        for k in range(K):
+            dp = A_ref[k, :3]
+            tau_k = self._eef_delta_to_tau(q, qdot, dp)
             tau_ref[k] = tau_k
             q, qdot = self._dynamics_step(q, qdot, tau_k)
+
         return tau_ref
 
-    def _eef_delta_to_tau(self, q: np.ndarray, qdot: np.ndarray, dp: np.ndarray) -> np.ndarray:
+    def _eef_delta_to_tau(self, q_arm: np.ndarray, qdot_arm: np.ndarray, dp: np.ndarray) -> np.ndarray:
         """
-        dp: 원하는 EEF position delta (world)
-        → Jacobian 기반의 Cartesian PD control → joint torque (7,)
+        Task-space PD:
+          err = dp
+          v_ee ≈ J0 qdot
+          F = Kp * err - Kd * v_ee
+          tau = J0^T F
         """
-        # 현재 상태 세팅
-        self.data.qpos[:] = q
-        self.data.qvel[:] = qdot
-        self.sim.forward()
+        v_ee = self._J0 @ qdot_arm
+        err = dp
+        F = self.tau_kp * err - self.tau_kd * v_ee
+        tau = self._J0.T @ F
+        return tau.astype(np.float32)
 
-        # 현재 EE 위치
-        p_cur = self._get_ee_pos_from_state()
+    def _dynamics_step(self, q: np.ndarray, qdot: np.ndarray, tau: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        매우 단순한 joint-space dynamics 근사:
+          qddot ≈ tau  (M = I, bias = 0 가정)
+        """
+        qddot = tau  # 필요하면 1 / inertia_scale 등으로 rescale 가능
+        q_next = q + qdot * self.dt
+        qdot_next = qdot + qddot * self.dt
+        return q_next, qdot_next
 
-        # J_pos ∈ R^{3x7}
-        J_pos = self._compute_pos_jacobian_fd(q, qdot)  # finite-diff Jacobian
-        qdot_arm = qdot[self.arm_vel_idx]  # (7,)
-        v_ee = J_pos @ qdot_arm
-
-        p_des = p_cur + dp
-        err = p_des - p_cur
-        F = self.tau_kp * err - self.tau_kd * v_ee  # 3D Cartesian force
-        tau_arm = J_pos.T @ F  # (7,)
-        return tau_arm.astype(np.float32)
-
-    # --------------------------------------------------------------------------
-    # Phase logic
-    # --------------------------------------------------------------------------
     def _compute_phase(self, d: float, g_cmd: float) -> str:
         if d <= self.d_close or g_cmd < -0.2:
             return "grasp"
@@ -521,7 +558,7 @@ class JointTorqueMujocoMPPIController:
 
 
 # ======================================================================
-# LIBERO eval + MPPI
+# eval_libero (MPPI 포함)
 # ======================================================================
 
 def eval_libero(args: Args) -> None:
@@ -552,7 +589,6 @@ def eval_libero(args: Args) -> None:
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
-
         target_obj_name = _resolve_target_object(env)
         motion_obj_name = args.motion_object_name or target_obj_name
         base_qpos = (
@@ -561,11 +597,11 @@ def eval_libero(args: Args) -> None:
             else None
         )
 
-        # build MPPI once (need dt)
+        # build MPPI once (need dt, robot)
         if controller is None and args.use_mppi:
             dt = 1.0 / env.env.control_freq if hasattr(env.env, "control_freq") else env.env.sim.model.opt.timestep
             if args.mppi_mode == "joint_torque":
-                # robosuite Robot 객체 사용 (첫 번째 로봇)
+                # robosuite 기반 env라면 robots[0] 이 Panda일 것
                 robot = env.env.robots[0]
                 controller = JointTorqueMujocoMPPIController(
                     horizon=args.mppi_horizon,
@@ -675,7 +711,7 @@ def eval_libero(args: Args) -> None:
                     obj_vel = (curr_obj_pos - prev_obj_pos) / max(curr_time - prev_obj_time, 1e-6)
                     prev_obj_pos, prev_obj_time = curr_obj_pos, curr_time
 
-                    # Hybrid control: MPPI (kinematics / joint torque) around A_ref
+                    # Hybrid control: MPPI around A_ref
                     if args.use_mppi and controller is not None:
                         x0 = np.concatenate(
                             (
@@ -686,12 +722,12 @@ def eval_libero(args: Args) -> None:
                         )
                         gripper_cmd_ref = float(A_ref[0][-1])
                         if isinstance(controller, JointTorqueMujocoMPPIController):
-                            # Joint-torque MPPI: q, qdot from sim
-                            q0 = env.env.sim.data.qpos.copy()
-                            qdot0 = env.env.sim.data.qvel.copy()
+                            # torque MPPI: full joint state from sim
+                            q0_full = env.env.sim.data.qpos.copy()
+                            qdot0_full = env.env.sim.data.qvel.copy()
                             delta_chunk = controller.plan(
-                                q0=q0,
-                                qdot0=qdot0,
+                                q0_full=q0_full,
+                                qdot0_full=qdot0_full,
                                 A_ref=A_ref,
                                 p_obj=curr_obj_pos,
                                 v_obj=obj_vel,
@@ -746,7 +782,7 @@ def eval_libero(args: Args) -> None:
 
 
 # ======================================================================
-# Helper functions
+# Helpers
 # ======================================================================
 
 def _get_libero_env(task, resolution, seed):
@@ -784,6 +820,7 @@ def _resolve_target_object(env) -> str:
             except Exception:
                 continue
         return env.obj_of_interest[0]
+    # Last resort: pick first key from objects_dict
     if hasattr(env.env, "objects_dict") and env.env.objects_dict:
         return list(env.env.objects_dict.keys())[0]
     raise ValueError("No target object could be resolved from the environment.")
@@ -807,6 +844,7 @@ def _set_object_qpos(env, obj_name, qpos):
     joint = _get_object_joint_name(env, obj_name)
     sim = env.env.sim
     sim.data.set_joint_qpos(joint, qpos)
+    # Zero the corresponding joint velocity to avoid residual drift
     try:
         qvel_addr = sim.model.get_joint_qvel_addr(joint)
         if isinstance(qvel_addr, (list, tuple, np.ndarray)):
@@ -825,6 +863,7 @@ def _set_object_qvel(env, obj_name, qvel):
 
 
 def _apply_xy_sine_motion(env, obj_name, base_qpos, t_sec, amp_xy, freq_hz, mode):
+    # No-op if amplitude is effectively zero
     if abs(amp_xy[0]) < 1e-6 and abs(amp_xy[1]) < 1e-6:
         return
 
