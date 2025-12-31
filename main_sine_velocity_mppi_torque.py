@@ -49,7 +49,7 @@ class Args:
     use_mppi: bool = True
 
     # MPPI mode
-    mppi_mode: str = "eef_kinematics"  # or "joint_torque"
+    # mppi_mode: str = "eef_kinematics"  # or "joint_torque"
     mppi_mode: str = "joint_torque"  # or "joint_torque"
 
     # MPPI params (kinematics-only defaults)
@@ -290,7 +290,10 @@ class JointTorqueMujocoMPPIController:
         else:
             # fallback
             self.arm_dof = 7
-        self.arm_vel_idx = np.array(robot._ref_joint_vel_indexes, dtype=int) # 
+        self.arm_vel_idx = np.array(robot._ref_joint_vel_indexes, dtype=int)
+
+        self.model = getattr(sim, "model", None)
+        self.data = getattr(sim, "data", None   )
         # Robot DOF (Franka arm = 7)
         self.ndof = int(robot.dof)
 
@@ -535,13 +538,16 @@ class JointTorqueMujocoMPPIController:
         # robosuite의 model에는 name -> id utility가 있음
         # body 먼저
         try:
-            bid = model.body_name2id(name_hint)
+            # bid = model.body_name2id(name_hint)
+            bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name_hint)
             return bid, False
         except Exception:
             pass
         # site 시도
         try:
-            sid = model.site_name2id(name_hint)
+            # sid = model.site_name2id(name_hint)
+            sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name_hint)
+
             return sid, True
         except Exception:
             pass
@@ -780,8 +786,8 @@ def eval_libero(args: Args) -> None:
                     if args.visualize and (t % max(1, args.visualize_every_n) == 0):
                         # img is RGB; OpenCV expects BGR
                         cv2.imshow("agentview", img[...,::-1])
-                        key = cv2.waitKey(Args.visualize_wait_ms) & 0xFF
-                        if key == 27: # ESC to abort episode/looop
+                        key = cv2.waitKey(args.visualize_wait_ms) & 0xFF
+                        if key == 27: # ESC to abort episode/loop
                             logging.info("ESC pressed. Stopping evaluation early.")
                             raise KeyboardInterrupt()
 
@@ -894,7 +900,7 @@ def _get_libero_env(task, resolution, seed):
 
 def action_unscale_3d(u: np.ndarray) -> np.ndarray:
     # axis scale: (output_max - output_min)/(input_max-input_min)
-    # (action - mid_in)8scale + mid_out
+    # (action - mid_in)*scale + mid_out
     unscaled_action = np.zeros(3, dtype=np.float32)
     unscaled_action[0] = (u[0] - 0.0) * 0.05 + 0.0
     unscaled_action[1] = (u[1] - 0.0) * 0.05 + 0.0
@@ -904,28 +910,28 @@ def action_unscale_3d(u: np.ndarray) -> np.ndarray:
 
 def action_unscale(u: np.ndarray) -> np.ndarray:
     # axis scale: (output_max - output_min)/(input_max-input_min)
-    # (action - mid_in)8scale + mid_out
+    # (action - mid_in)*scale + mid_out
     unscaled_action = np.zeros(7, dtype=np.float32)
     unscaled_action[0] = (u[0] - 0.0) * 0.05 + 0.0
     unscaled_action[1] = (u[1] - 0.0) * 0.05 + 0.0
     unscaled_action[2] = (u[2] - 0.0) * 0.05 + 0.0
-    unscaled_action[3] = (u[3] - 0.0) * 0.05 + 0.0
-    unscaled_action[4] = (u[4] - 0.0) * 0.05 + 0.0
-    unscaled_action[5] = (u[5] - 0.0) * 0.05 + 0.0
+    unscaled_action[3] = (u[3] - 0.0) * 0.5 + 0.0
+    unscaled_action[4] = (u[4] - 0.0) * 0.5 + 0.0
+    unscaled_action[5] = (u[5] - 0.0) * 0.5 + 0.0
     unscaled_action[6] = u[6]
     return unscaled_action
 
 
 def action_scale(u: np.ndarray) -> np.ndarray:
     # axis scale: (input_max - input_min)/(output_max-output_min)
-    # (action - mid_out)8scale + mid_in
+    # (action - mid_out)*scale + mid_in
     scaled_action = np.zeros(7, dtype=np.float32)
     scaled_action[0] = (u[0] - 0.0) / 0.05 + 0.0
     scaled_action[1] = (u[1] - 0.0) / 0.05 + 0.0
     scaled_action[2] = (u[2] - 0.0) / 0.05 + 0.0
-    scaled_action[3] = (u[3] - 0.0) / 0.05 + 0.0
-    scaled_action[4] = (u[4] - 0.0) / 0.05 + 0.0
-    scaled_action[5] = (u[5] - 0.0) / 0.05 + 0.0
+    scaled_action[3] = (u[3] - 0.0) / 0.5 + 0.0
+    scaled_action[4] = (u[4] - 0.0) / 0.5 + 0.0
+    scaled_action[5] = (u[5] - 0.0) / 0.5 + 0.0
     scaled_action[6] = u[6]
     return scaled_action
 
